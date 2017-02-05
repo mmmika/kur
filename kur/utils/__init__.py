@@ -16,7 +16,7 @@ limitations under the License.
 
 from .subclass import get_subclasses
 from .flatiter import flatten, concatenate
-from .iterhelp import get_any_value, merge_dict, parallelize
+from .iterhelp import get_any_value, merge_dict, parallelize, partial_sum
 from .importhelp import can_import
 from .network import download, get_hash
 from .timer import Timer
@@ -27,7 +27,6 @@ from .environtools import EnvironmentalVariable
 from .contexttools import redirect_stderr
 from .package import unpack, canonicalize, install
 from .filetools import count_lines
-from .shuffleable import Shuffleable
 from .audiotools import load_audio, get_audio_features
 from .normalize import Normalize
 

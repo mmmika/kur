@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .evaluation_hook import EvaluationHook
+from .hooks import TrainingHook, EvaluationHook, UpdateTruth
 from .output_hook import OutputHook
 from .mnist_hook import MnistHook
 from .transcript import TranscriptHook
+from .slack_hook import SlackHook
 
 ### EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF.EOF

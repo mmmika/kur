@@ -16,10 +16,13 @@ limitations under the License.
 
 import logging
 import shutil
-import tempfile
 import math
+import time
+import traceback
+import numpy
 import tqdm
 from ..utils import get_any_value, CriticalSection, parallelize
+from .hooks import TrainingHook, UpdateTruth
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +46,8 @@ class Executor:
 		self.optimizer = optimizer
 
 	###########################################################################
-	def compile(self, target=None, recompile=False, with_provider=None):
+	def compile(self, target=None, recompile=False, with_provider=None,
+		**kwargs):
 		""" Compiles a model.
 
 			This generates a backend-specific representation of the model,
@@ -89,7 +93,8 @@ class Executor:
 			model=self.model,
 			loss=self.loss if target != 'evaluate' else None,
 			optimizer=None if target != 'train' else self.optimizer,
-			blocking=True
+			blocking=True,
+			**kwargs
 		)
 
 		if with_provider is not None:
@@ -175,27 +180,34 @@ class Executor:
 			prediction, batch = first_batch
 			for hook in hooks:
 				prediction = hook.apply(prediction, batch, self.model)
+				if isinstance(prediction, UpdateTruth):
+					prediction, batch = prediction.data, prediction.truth
 
 		return test_loss
 
 	###########################################################################
-	def train(self, *args, last_weights=None, log=None, **kwargs):
+	def train(self, *args, last_weights=None, log=None, training_hooks=None,
+		**kwargs):
 		""" Trains the model on some data.
 
 			This is the public entry point for training. It wraps the business
 			logic so that it can handle error conditions.
 		"""
 
+		reason = 'unknown'
 		try:
 			result = self.wrapped_train(
 				*args,
 				log=log,
+				training_hooks=training_hooks,
 				**kwargs
 			)
-		except:
+		except (KeyboardInterrupt, Exception) as exc:
 			logger.exception('Exception raised during training.')
+			reason = traceback.format_exception_only(type(exc), exc)[0].strip()
 			raise
 		else:
+			reason = 'success'
 			return result
 		finally:
 			if last_weights is not None:
@@ -205,9 +217,14 @@ class Executor:
 			if log is not None:
 				log.flush()
 
+			if training_hooks:
+				for hook in training_hooks:
+					hook.notify(TrainingHook.TRAINING_END, {'Reason' : reason})
+
 	###########################################################################
 	def wrapped_train(self, provider, *, validation=None, epochs=None,
-		log=None, best_train=None, best_valid=None, validation_hooks=None):
+		log=None, best_train=None, best_valid=None, training_hooks=None,
+		validation_hooks=None, checkpoint=None):
 		""" Trains the model on some data.
 
 			# Arguments
@@ -229,10 +246,37 @@ class Executor:
 		self.compile('train', with_provider=provider)
 		provider.source_shapes()
 
+		if isinstance(checkpoint, dict):
+			if 'path' not in checkpoint:
+				checkpoint['path'] = 'checkpoint'
+
+			found = False
+			for k in ('epochs', 'batches', 'samples'):
+				if k in checkpoint:
+					if not isinstance(checkpoint[k], int):
+						raise ValueError('Expected "{}" key in "checkpoint" '
+							'to be an integer. Received: {}'.format(k,
+							checkpoint[k]))
+					found = True
+
+			if not found:
+				checkpoint['epochs'] = 1
+
+		elif isinstance(checkpoint, str):
+			checkpoint = {
+				'path' : checkpoint,
+				'epochs' : 1
+			}
+		elif checkpoint is not None:
+			raise ValueError('Unknown format for "checkpoint". Expected a '
+				'single file or a dictionary. Instead we received: {}'
+				.format(checkpoint))
+
 		if log is None:
 			logger.info('No log specified, so no historical loss information '
 				'is available.')
 			best_train_loss = best_valid_loss = None
+			completed_epochs = None
 		else:
 			best_train_loss = log.get_best_training_loss()
 			if best_train_loss is not None:
@@ -249,15 +293,62 @@ class Executor:
 				logger.info(
 					'No historical validation loss available from logs.')
 
+			completed_epochs = log.get_number_of_epochs()
+
+		if completed_epochs is None:
+			completed_epochs = 0
+			logger.info('No previous epochs.')
+		else:
+			logger.info('Restarting from epoch %d.', completed_epochs+1)
+
+		valid_modes = ('total', 'additional')
+		default_mode = 'additional'
+		mode = default_mode
+		if isinstance(epochs, dict):
+			mode = epochs.get('mode', default_mode)
+			if mode not in valid_modes:
+				raise ValueError('If "mode" in "epochs" must be one of: {}. '
+					'Instead, we received: {}.'.format(', '.join(valid_modes),
+					mode))
+			if mode == 'total' and log is None:
+				logger.warning('The epoch specification has "mode" set to '
+					'"%s". This mode requires a log to be used correctly. Kur '
+					'will proceed as if "mode" were "%s".', mode, default_mode)
+				mode = default_mode
+			epochs = epochs.get('number')
+			if epochs in ('inf', 'all', 'infinite', 'infinity'):
+				epochs = None
+		elif not isinstance(epochs, (int, type(None))):
+			raise ValueError('Expected "epochs" to be a dictionary or '
+				'integer. Instead, we received: {}.'.format(epochs))
+		logger.debug('Epoch handling mode: %s', mode)
+
+		if epochs is not None:
+			if mode == 'additional':
+				epochs += completed_epochs
+
 		# The name of the most recently saved weight file. If the weights
 		# change, this should be reset to None. Otherwise, saving weights can
 		# be as simple as copying the previously saved file.
 		saved_recent = None
 
-		epoch = -1
+		if training_hooks:
+			for hook in training_hooks:
+				hook.notify(TrainingHook.TRAINING_START)
+
+		session = {
+			'epochs' : 0,
+			'batches' : 0,
+			'samples' : 0,
+			'minutes' : time.perf_counter() / 60
+		}
+		last_checkpoint = session.copy()
+
+		epoch = completed_epochs - 1
 		while True:
 			epoch += 1
 			if epochs is not None and epoch >= epochs:
+				print('Completed {} epochs.'.format(epochs))
 				break
 
 			# We are about to modify the weights. Invalidate the name of the
@@ -265,6 +356,9 @@ class Executor:
 			saved_recent = None
 
 			print()
+
+			###################################################################
+			# START: Train one epoch
 
 			# Create progress bar
 			train_loss = None
@@ -292,6 +386,24 @@ class Executor:
 
 					# How many entries we just processed.
 					batch_size = len(get_any_value(batch))
+
+					# Update our session statistics.
+					session['batches'] += 1
+					session['samples'] += batch_size
+					session['minutes'] = time.perf_counter() / 60
+
+					# Checkpoint if necessary
+					if checkpoint is not None:
+						for k in ('samples', 'batches', 'minutes'):
+							if k not in checkpoint:
+								continue
+							if session[k] - last_checkpoint[k] > checkpoint[k]:
+								logger.info('Making checkpoint backup: %s',
+									checkpoint['path'])
+								with CriticalSection():
+									self.model.save(checkpoint['path'])
+								last_checkpoint = session.copy()
+								break
 
 					# How many entries we've processed this epoch.
 					new_entries = n_entries + batch_size
@@ -329,25 +441,46 @@ class Executor:
 								'switching optimizers or backend.', k)
 							return
 
+			# END: Train one epoch
+			###################################################################
+
+			# Update our session statistics.
+			session['epochs'] += 1
+
+			# Checkpoint if necessary
+			if checkpoint is not None:
+				k = 'epochs'
+				if k in checkpoint:
+					if session[k] - last_checkpoint[k] > checkpoint[k]:
+						logger.info('Making checkpoint backup: %s',
+							checkpoint['path'])
+						with CriticalSection():
+							self.model.save(checkpoint['path'])
+						last_checkpoint = session.copy()
+
 			if not n_entries:
-				logger.warning('No data provided to training loop. Trying to '
-					'move on to the next epoch.')
-				continue
+				logger.warning('No data provided to training loop.')
+				cur_train_loss = None
+			else:
+				cur_train_loss = sum(train_loss.values())
+				logger.info('Training loss: %.3f', cur_train_loss)
 
-			cur_train_loss = sum(train_loss.values())
-			logger.info('Training loss: %.3f', cur_train_loss)
+				if best_train is not None:
+					if best_train_loss is None or \
+						cur_train_loss < best_train_loss:
 
-			if best_train is not None:
-				if best_train_loss is None or cur_train_loss < best_train_loss:
-					logger.info('Saving best historical training weights: %s',
-						best_train)
-					best_train_loss = cur_train_loss
-					with CriticalSection():
-						self.model.save(best_train)
-					saved_recent = best_train
+						logger.info('Saving best historical training weights: '
+							'%s', best_train)
+						best_train_loss = cur_train_loss
+						with CriticalSection():
+							self.model.save(best_train)
+						saved_recent = best_train
 
-			if log is not None:
-				log.log_training(train_loss, 'loss')
+				if log is not None:
+					log.log_training(train_loss, 'loss')
+
+			###################################################################
+			# START: Validate
 
 			if validation is not None:
 				# Continue with a validation run.
@@ -383,6 +516,20 @@ class Executor:
 
 				if log is not None:
 					log.log_validation(validation_loss, 'loss')
+
+			# END: Validate
+			###################################################################
+
+			if training_hooks:
+				info = {
+					'epoch' : epoch+1,
+					'total_epochs' : epochs,
+					'Training loss' : cur_train_loss
+				}
+				if validation is not None:
+					info['Validation loss'] = validation_loss
+				for hook in training_hooks:
+					hook.notify(TrainingHook.EPOCH_END, info)
 
 	###########################################################################
 	def evaluate(self, provider, callback=None):

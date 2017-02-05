@@ -102,9 +102,7 @@ class KerasBackend(Backend):
 					logger.error('Your Kurfile is trying to use TensorFlow.')
 					logger.error('However, we cannot find TensorFlow '
 						'installed.')
-					logger.error('It is easy to install, but you need to make '
-						'sure you are using Python 3.4 or 3.5 (3.6 does not '
-						'work).')
+					logger.error('At least it is easy to install!')
 					logger.error('To install TensorFlow for CPU: pip install '
 						'tensorflow')
 					logger.error('To install TensorFlow for GPU: pip install '
@@ -112,8 +110,8 @@ class KerasBackend(Backend):
 					logger.error('See our troubleshooting page for more '
 						'information: %s', os.path.join(__homepage__,
 						'troubleshooting.html'))
-					raise ValueError('Need to install TensorFlow with Python '
-						'3.4 or Python 3.5 for this Kurfile to work.')
+					raise ValueError('Need to install TensorFlow for this '
+						'Kurfile to work.')
 				else:
 					logger.warning('The Keras backend was asked to use the %s '
 						'backend, but %s does not appear to be installed. You '
@@ -436,7 +434,8 @@ class KerasBackend(Backend):
 		else:
 			raise ValueError('Failed to find a layer named "{}"'
 				.format(layer_name))
-		for keras_layer, kur_layer in zip(model.compiled['raw'].outputs, model.outputs):
+		for keras_layer, kur_layer in \
+			zip(model.compiled['raw'].outputs, model.outputs):
 			if kur_layer == target:
 				return keras_layer
 		raise ValueError('Did not find expected layer. This is a bug.')
@@ -452,6 +451,16 @@ class KerasBackend(Backend):
 				of model layer names mapped to Loss instances.
 		"""
 		import keras.backend as K
+
+		if loss is None:
+			num_outputs = len(model.outputs)
+			logger.error('You are trying to construct a training/validation'
+				'/testing model, but you haven\'t specified any loss '
+				'functions. Your model has %d outputs: %s. You need to '
+				'specify %d loss functions, one for each output.',
+				num_outputs, ', '.join(model.outputs), num_outputs)
+			raise ValueError('No loss functions were specified, but are '
+				'required for training, testing, and validation.')
 
 		if isinstance(loss, Loss):
 			loss = [loss]
@@ -494,7 +503,8 @@ class KerasBackend(Backend):
 		return loss_inputs, loss_outputs, total_loss
 
 	###########################################################################
-	def compile(self, model, loss=None, optimizer=None, blocking=True):
+	def compile(self, model, loss=None, optimizer=None, blocking=True,
+		assemble_only=False):
 		""" Returns the Keras model instance.
 		"""
 		if model.compiled is None:
@@ -526,11 +536,12 @@ class KerasBackend(Backend):
 			logger.debug('Assembling an evaluation function from the model.')
 
 			loss_inputs = loss_outputs = {}
-			func = K.function(
-				compiled.inputs + \
-					[K.learning_phase()],
-				compiled.outputs
-			)
+			if not assemble_only:
+				func = K.function(
+					compiled.inputs + \
+						[K.learning_phase()],
+					compiled.outputs
+				)
 			key = 'evaluate'
 
 		elif optimizer is None:
@@ -539,13 +550,14 @@ class KerasBackend(Backend):
 			loss_inputs, loss_outputs, _ = \
 				self.process_loss(model, loss)
 
-			func = K.function(
-				compiled.inputs + \
-					list(loss_inputs.values()) + \
-					[K.learning_phase()],
-				compiled.outputs + \
-					list(loss_outputs.values())
-			)
+			if not assemble_only:
+				func = K.function(
+					compiled.inputs + \
+						list(loss_inputs.values()) + \
+						[K.learning_phase()],
+					compiled.outputs + \
+						list(loss_outputs.values())
+				)
 			key = 'test'
 
 		else:
@@ -560,14 +572,15 @@ class KerasBackend(Backend):
 				compiled.trainable_weights, total_loss
 			)
 
-			func = K.function(
-				compiled.inputs + \
-					list(loss_inputs.values()) + \
-					[K.learning_phase()],
-				compiled.outputs + \
-					list(loss_outputs.values()),
-				updates=updates
-			)
+			if not assemble_only:
+				func = K.function(
+					compiled.inputs + \
+						list(loss_inputs.values()) + \
+						[K.learning_phase()],
+					compiled.outputs + \
+						list(loss_outputs.values()),
+					updates=updates
+				)
 			key = 'train'
 
 		logger.debug('Additional inputs for log functions: %s',
@@ -591,7 +604,10 @@ class KerasBackend(Backend):
 				zip(input_names, input_shapes)
 			))
 
-		model.compiled[key] = {
+		if assemble_only:
+			func = None
+
+		result = {
 			'func' : func,
 			'names' : {
 				'input' : input_names,
@@ -603,12 +619,14 @@ class KerasBackend(Backend):
 		}
 
 		if logger.isEnabledFor(logging.DEBUG):
-			logger.debug('Compiled model: %s', model.compiled[key])
+			logger.debug('Compiled model: %s', result)
 
-		if blocking:
-			self.wait_for_compile(model, key)
+		if not assemble_only:
+			model.compiled[key] = result
+			if blocking:
+				self.wait_for_compile(model, key)
 
-		return model.compiled[key]
+		return result
 
 	###########################################################################
 	def wait_for_compile(self, model, key):

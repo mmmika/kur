@@ -21,7 +21,7 @@ import logging
 from .engine import ScopeStack
 from .reader import Reader
 from .containers import Container, ParsingError
-from .model import Model, Executor, EvaluationHook, OutputHook
+from .model import Model, Executor, EvaluationHook, OutputHook, TrainingHook, UpdateTruth
 from .backend import Backend
 from .optimizer import Optimizer, Adam
 from .loss import Loss
@@ -167,7 +167,7 @@ class Kurfile:
 		"""
 		if self.backend is None:
 			self.backend = Backend.from_specification(
-				self.data.get('settings', {}).get('backend')
+				(self.data.get('settings') or {}).get('backend')
 			)
 		return self.backend
 
@@ -203,13 +203,9 @@ class Kurfile:
 		else:
 			provider = Kurfile.DEFAULT_PROVIDER
 
-		# TODO: merge_dict is good for different columns, but we may need to
-		#   concatenate columns with the same names. Need ConcatenateSource.
 		return provider(
-			sources=merge_dict(
-				*[supplier.get_sources() for supplier in suppliers]
-			),
-			**provider_spec		# Everything remaining are parameters.
+			sources=Supplier.merge_suppliers(suppliers),
+			**provider_spec
 		)
 
 	###########################################################################
@@ -229,6 +225,13 @@ class Kurfile:
 
 		provider = self.get_provider('train')
 
+		training_hooks = self.data['train'].get('hooks', [])
+		if not isinstance(training_hooks, (list, tuple)):
+			raise ValueError('"hooks" (in the "train" section) should '
+				'be a list of hook specifications.')
+		training_hooks = [TrainingHook.from_specification(spec) \
+			for spec in training_hooks]
+
 		if 'validate' in self.data:
 			validation = self.get_provider('validate')
 			validation_weights = self.data['validate'].get('weights')
@@ -241,32 +244,37 @@ class Kurfile:
 			else:
 				raise ValueError('Unknown type for validation weights: {}'
 					.format(validation_weights))
+
+			validation_hooks = self.data['validate'].get('hooks', [])
+			if not isinstance(validation_hooks, (list, tuple)):
+				raise ValueError('"hooks" (in the "validate" section) should '
+					'be a list of hook specifications.')
+			validation_hooks = [EvaluationHook.from_specification(spec) \
+				for spec in validation_hooks]
 		else:
 			validation = None
 			best_valid = None
+			validation_hooks = None
 
 		train_weights = self.data['train'].get('weights')
 		if train_weights is None:
 			initial_weights = best_train = last_weights = None
+			checkpoint = None
 		elif isinstance(train_weights, str):
 			initial_weights = train_weights
 			best_train = train_weights if best_valid is None else None
 			last_weights = None
 			initial_must_exist = False
+			checkpoint = None
 		elif isinstance(train_weights, dict):
 			initial_weights = train_weights.get('initial')
 			best_train = train_weights.get('best')
 			last_weights = train_weights.get('last')
 			initial_must_exist = train_weights.get('must_exist', False)
+			checkpoint = train_weights.get('checkpoint')
 		else:
 			raise ValueError('Unknown weight specification for training: {}'
 				.format(train_weights))
-
-		hooks = self.data['validate'].get('hooks', [])
-		if not isinstance(hooks, (list, tuple)):
-			raise ValueError('"hooks" (in the "validate" section) should be a '
-			   'list of hook specifications.')
-		hooks = [EvaluationHook.from_specification(spec) for spec in hooks]
 
 		expand = lambda x: os.path.expanduser(os.path.expandvars(x))
 		initial_weights, best_train, best_valid, last_weights = [
@@ -311,7 +319,9 @@ class Kurfile:
 				best_train=best_train,
 				best_valid=best_valid,
 				last_weights=last_weights,
-				validation_hooks=hooks
+				training_hooks=training_hooks,
+				validation_hooks=validation_hooks,
+				checkpoint=checkpoint
 			)
 
 		return func
@@ -522,9 +532,13 @@ class Kurfile:
 				callback=None
 			)
 			for hook in hooks:
-				result = hook.apply(result, truth)
+				result = hook.apply(result, truth, model)
+				if isinstance(result, UpdateTruth):
+					result, truth = result.data, result.truth
 			if destination is not None:
-				result = destination.apply(result, truth)
+				result = destination.apply(result, truth, model)
+				if isinstance(result, UpdateTruth):
+					result, truth = result.data, result.truth
 			return result
 
 		return func

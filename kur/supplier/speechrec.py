@@ -22,7 +22,6 @@ import random
 import numpy
 
 from ..sources import DerivedSource, VanillaSource, ChunkSource
-from ..utils import Shuffleable
 from . import Supplier
 from ..utils import package
 from ..utils import count_lines
@@ -71,7 +70,7 @@ class Utterance(DerivedSource):
 		return (self.source, )
 
 ###############################################################################
-class RawUtterance(ChunkSource, Shuffleable):
+class RawUtterance(ChunkSource):
 	""" Data source for audio samples
 	"""
 
@@ -153,17 +152,52 @@ class RawUtterance(ChunkSource, Shuffleable):
 		self.norm = norm
 
 	###########################################################################
+	def find_audio_path(self, partial_path):
+		""" Resolves the audio file extension.
+		"""
+		for ext in SpeechRecognitionSupplier.SUPPORTED_TYPES:
+			candidate = '{}.{}'.format(partial_path, ext)
+			if os.path.isfile(candidate):
+				return candidate
+		return None
+
+	###########################################################################
 	def load_audio(self, paths):
 		""" Loads unnormalized audio data.
 		"""
-		return [
-			get_audio_features(
-				path,
-				feature_type=self.feature_type,
-				high_freq=self.max_frequency
-			)
-			for path in paths
-		]
+		# Resolve and load each path.
+		result = [None] * len(paths)
+		for i, partial_path in enumerate(paths):
+			path = self.find_audio_path(partial_path)
+			if path is None:
+				logger.error('Could not find audio file that---ignoring '
+					'extension---begins with: %s', partial_path)
+			else:
+				result[i] = get_audio_features(
+					path,
+					feature_type=self.feature_type,
+					high_freq=self.max_frequency,
+					on_error='suppress'
+				)
+				if result[i] is None:
+					logger.error('Failed to load audio file at path: %s', path)
+
+		# Clean up bad audio
+		if any(x is None for x in result):
+			logger.warning('Recovering from a bad audio uttereance.')
+			good = None
+			for candidate in result:
+				if candidate is not None:
+					good = candidate
+					break
+			if good is None:
+				raise ValueError(
+					'Cannot tolerate an entire batch of bad audio.')
+			for i, x in enumerate(result):
+				if x is None:
+					result[i] = good
+
+		return result
 
 	###########################################################################
 	def train_normalizer(self, norm, depth):
@@ -211,6 +245,12 @@ class RawUtterance(ChunkSource, Shuffleable):
 		return (None, self.features)
 
 	###########################################################################
+	def can_shuffle(self):
+		""" This source can be shuffled.
+		"""
+		return True
+
+	###########################################################################
 	def shuffle(self, indices):
 		""" Applies a permutation to the data.
 		"""
@@ -254,7 +294,7 @@ class Transcript(DerivedSource):
 		return (self.source, )
 
 ###############################################################################
-class RawTranscript(ChunkSource, Shuffleable):
+class RawTranscript(ChunkSource):
 	""" Data source for variable-length transcripts.
 	"""
 
@@ -350,6 +390,12 @@ class RawTranscript(ChunkSource, Shuffleable):
 		return (None, )
 
 	###########################################################################
+	def can_shuffle(self):
+		""" This source can be shuffled.
+		"""
+		return True
+
+	###########################################################################
 	def shuffle(self, indices):
 		""" Applies a permutation to the data.
 		"""
@@ -421,46 +467,67 @@ class SpeechRecognitionSupplier(Supplier):
 			checksum=checksum
 		)
 
+		manifest = None
 		if is_packed and unpack:
 			logger.debug('Unpacking input data: %s', local_path)
-			extracted = package.unpack(local_path, recursive=True)
+			manifest = package.unpack(local_path, recursive=True)
 			is_packed = False
 		elif is_packed and not unpack:
 			logger.debug('Using packed input data.')
 			raise NotImplementedError
 		elif not is_packed and unpack:
 			logger.debug('Using already unpacked input data.')
-			extracted = []
-			for dirpath, _, filenames in os.walk(local_path):
-				extracted.extend([
-					package.canonicalize(os.path.join(dirpath, filename))
-					for filename in filenames
-				])
 		elif not is_packed and not unpack:
 			logger.debug('Ignore "unpack" for input data, since it is already '
 				'unpacked.')
 		else:
 			logger.error('Unhandled data package requirements. This is a bug.')
 
-		self.metadata, self.data = self.get_metadata(extracted, max_duration)
+		self.metadata, self.data = self.get_metadata(
+			manifest=manifest,
+			root=local_path,
+			max_duration=max_duration
+		)
 
 	###########################################################################
-	def get_metadata(self, package_contents, max_duration):
+	def get_metadata(self, manifest=None, root=None, max_duration=None):
 		""" Scans the package for a metadata file, makes sure everything is in
 			order, and returns some information about the data set.
 		"""
 		logger.debug('Looking for metadata file.')
 		metadata_file = None
-		for filename in package_contents:
-			parts = os.path.splitext(filename)
-			if parts[1].lower() == '.jsonl' and \
-				not os.path.basename(filename).startswith('.'):
-				metadata_file = filename
-				source = os.path.join(os.path.dirname(metadata_file), 'audio')
-				break
+
+		def look_in_list(filenames):
+			""" Searches a list of files for a JSONL file.
+			"""
+			for filename in filenames:
+				parts = os.path.splitext(filename)
+				if parts[1].lower() == '.jsonl' and \
+					not os.path.basename(filename).startswith('.'):
+					return filename
+			return None
+
+		if manifest is None:
+			if root is None:
+				raise ValueError('No root provided and no manifest provided. '
+					'This is a bug.')
+			if not os.path.isdir(root):
+				raise ValueError('Root is not a directory. This is a bug.')
+			for dirpath, _, filenames in os.walk(root):
+				metadata_file = look_in_list(filenames)
+				if metadata_file is not None:
+					metadata_file = os.path.join(dirpath, metadata_file)
+					break
+		else:
+			metadata_file = look_in_list(manifest)
 
 		if metadata_file is None:
 			raise ValueError('Failed to find a JSONL metadata file.')
+
+		source = os.path.join(
+			os.path.dirname(metadata_file),
+			'audio'
+		)
 
 		logger.debug('Found metadata file: %s', metadata_file)
 		logger.debug('Inferred source path: %s', source)
@@ -496,19 +563,7 @@ class SpeechRecognitionSupplier(Supplier):
 
 				data['duration'][entries] = entry['duration_s']
 				data['transcript'][entries] = entry['text']
-
-				audio = os.path.join(source, entry['uuid'])
-				for ext in SpeechRecognitionSupplier.SUPPORTED_TYPES:
-					candidate = '{}.{}'.format(audio, ext)
-					if os.path.isfile(candidate):
-						data['audio'][entries] = candidate
-						break
-				else:
-					logger.warning('Line %d in the metadata file (%s) '
-						'references UUID %s, but we could not find a '
-						'supported audio file type: %s.*', line_number,
-						metadata_file, entry['uuid'], audio)
-					continue
+				data['audio'][entries] = os.path.join(source, entry['uuid'])
 
 				entries += 1
 

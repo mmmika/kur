@@ -584,6 +584,34 @@ train for during a ``kur train`` run. If it isn't specified (or if it is set to
 an empty or null value), then Kur trains interminably (or rather, until you
 Ctrl+C the process).
 
+The ``epochs`` field tells Kur how many epochs to train for during a ``kur
+train`` run. If it isn't specified (or if it is set to an empty or null value),
+then Kur trains interminably (or rather, until you Ctrl+C the process). If you
+set it to an integer, then Kur will train for that many epochs every time ``kur
+train`` is called. More complicated configurations can be specified with:
+
+.. code-block:: yaml
+
+	epochs:
+	  number: NUMBER
+	  mode: MODE
+
+``NUMBER`` is the number of epochs to train for. To train forever, set this to
+``null`` or ``infinite``. For finite values of ``NUMBER``, ``MODE`` tells Kur
+how to interpret ``NUMBER`` and can be one of the following:
+
+- ``additional``. Kur will train for ``NUMBER`` epochs every time ``kur train``
+  is called. This is the default, and is equivalent to the shorter ``epochs:
+  NUMBER`` syntax.
+- ``total``. Using the :ref:`log_spec`, Kur will train for exactly ``NUMBER``
+  epochs total, regardless of how many times ``kur train`` is called. For
+  example, let's say that ``NUMBER`` is 10 in ``total`` mode. You call ``kur
+  train`` but interrupt it after epoch 6 completes. If you can ``kur train``
+  again, it will only train for 4 more epochs (to reach its total of 10). If
+  you call ``kur train`` a third time, it will simply report that has already
+  finished 10 epochs. If a log is not specified, Kur will warn you but proceed
+  training as if ``MODE`` were ``additional``.
+
 Optimizer
 ---------
 
@@ -698,6 +726,9 @@ The most flexibility can be gleaned from a dictionary-like value:
 	  # Where to save the most recent model weights.
 	  last: LAST
 
+	  # How to create checkpoints.
+	  checkpoint: CHECKPOINT
+
 Each of the fields is optional.
 
 The best weights that Kur saves (whether specified with ``best:`` or just with
@@ -706,6 +737,40 @@ lowest loss values. Kur uses its log, when available, to decide when it has
 encountered a historically low loss value, even if it encountered it during a
 previous training run. See :ref:`log_spec` for more information on saving to a
 log.
+
+The ``CHECKPOINT`` field is for creating intermediate checkpoints. If it is a
+dictionary, it should look like this:
+
+.. code-block:: yaml
+
+	checkpoint:
+	  path: PATH
+	  epochs: EPOCHS
+	  batches: BATCHES
+	  samples: SAMPLES
+	  minutes: MINUTES
+
+``PATH`` is the name of the path to save the checkpoint to. It defaults to
+``checkpoint`` if not specified. The other fields---``EPOCHS``, ``BATCHES``,
+``SAMPLES``, ``MINUTES``---are all optional. If specified, they indicate how
+often the checkpoint should be created. They can be used together; for example,
+consider this specification:
+
+.. code-block:: yaml
+
+	checkpoint:
+	  batches: 10
+	  samples: 1000
+
+Here, the model will be saved after every 10 batches or after every 1000
+samples, whichever comes first. Once a checkpoint is created, the internal
+counter is reset. So if ``SAMPLES`` causes a checkpoint to be created after
+1000 samples, then the next checkpoint will not be created for another 10
+batches or another 1000 samples, whichever comes first.
+
+``CHECKPOINT`` can also be a string instead of a dictionary. In this case,
+the string specifies the ``PATH`` to checkpoint to, and the checkpoint is
+configured to save after every epoch (as if ``EPOCHS`` were 1).
 
 .. _validate_spec:
 
@@ -1366,3 +1431,23 @@ as part of Kur:
 - ``transcript``: This is useful for performing argmax-decoding of the ASR
   pipeline, effectively turning your model outputs into true transcriptions.
   This is intended as a ``test``/``validate`` hook.
+- ``slack``: This is useful for posting to a Slack channel using Slack's
+  `incoming webhooks <https://api.slack.com/custom-integrations>`_. It is
+  intended as both a training and evaluation hook. It takes this form:
+
+  .. code-block:: yaml
+
+	slack:
+	  channel: CHANNEL
+	  url: URL
+	  icon: ICON
+	  user: USER
+	  title: TITLE
+
+  ``CHANNEL`` is the name of the Slack channel to post to (e.g, "#kur") and is
+  required. ``URL`` is the Slack webhook URL and is required. ``ICON`` is the
+  name of the Emoji to use in the posts (e.g., "dragon") and is optional.
+  ``USER`` is the name of the user to post as (e.g., "kur-bot") and is
+  optional. ``TITLE`` is a message that is prepended to the message body. It is
+  optional and is useful for distinguishing between different models that you
+  may be training (e.g., "model #1").
